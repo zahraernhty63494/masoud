@@ -1,0 +1,238 @@
+name: main1
+
+on:
+  workflow_dispatch:
+    inputs:
+      chain:
+        description: "بعد از 5 ساعت (10 دقیقه قبل از پایان) workflow بعدی تریگر شود؟"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write   # لازم برای تریگر کردن workflow دیگر
+
+concurrency:
+  group: vpn-tailscale-1
+  cancel-in-progress: false
+
+jobs:
+  tailscale-exit:
+    runs-on: ubuntu-latest
+
+    # کمی بیشتر از 5 ساعت (برای زمان نصب و ...)
+    timeout-minutes: 310
+
+    env:
+      # فایل workflow ای که باید تریگر شود
+      NEXT_WORKFLOW: main2.yml
+      # کل زمان زنده ماندن (ثانیه) = 5 ساعت
+      TOTAL_SECONDS: 18000
+      # چند ثانیه قبل از پایان، workflow بعدی تریگر شود = 10 دقیقه
+      TRIGGER_BEFORE_SECONDS: 600
+      # آیا زنجیره ادامه پیدا کند؟ (پیش‌فرض true)
+      CHAIN: ${{ inputs.chain }}
+
+    steps:
+
+      # -----------------------------------
+      # Save start time
+      # -----------------------------------
+      - name: Save start time
+        run: |
+          echo "START_TS=$(date +%s)" >> $GITHUB_ENV
+
+      # -----------------------------------
+      # Update System
+      # -----------------------------------
+      - name: Update system
+        run: |
+          sudo apt update -y
+
+      # -----------------------------------
+      # Install dependencies
+      # -----------------------------------
+      - name: Install packages
+        run: |
+          sudo apt install -y \
+            curl \
+            jq \
+            lsb-release \
+            iptables
+
+      # -----------------------------------
+      # Detect location & create hostname
+      # -----------------------------------
+      - name: Generate smart hostname
+        run: |
+
+          COUNTRY=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
+          CITY=$(curl -s https://ipinfo.io/city)
+
+          # حذف فاصله و کاراکترهای غیرمجاز
+          CITY_CLEAN=$(echo "$CITY" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/ /-/g' \
+            | sed 's/[^a-z0-9-]//g')
+
+          # ساعت شروع به وقت تهران
+          START_TIME=$(TZ=Asia/Tehran date +'%H-%M')
+
+          # ساعت پایان (5 ساعت بعد)
+          END_TIME=$(TZ=Asia/Tehran date -d '+5 hour' +'%H-%M')
+
+          # hostname نهایی
+          HOSTNAME="${CITY_CLEAN}--${START_TIME}--${END_TIME}"
+
+          echo "================================="
+          echo "Country : $COUNTRY"
+          echo "City    : $CITY"
+          echo "Hostname: $HOSTNAME"
+          echo "================================="
+
+          echo "HOSTNAME=$HOSTNAME" >> $GITHUB_ENV
+
+      # -----------------------------------
+      # Add Tailscale GPG key
+      # -----------------------------------
+      - name: Add Tailscale GPG key
+        run: |
+          curl -fsSL \
+          https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg \
+          | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+
+      # -----------------------------------
+      # Add Tailscale repository
+      # -----------------------------------
+      - name: Add Tailscale repository
+        run: |
+          curl -fsSL \
+          https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list \
+          | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+      # -----------------------------------
+      # Install Tailscale
+      # -----------------------------------
+      - name: Install Tailscale
+        run: |
+          sudo apt update
+          sudo apt install -y tailscale
+
+      # -----------------------------------
+      # Enable IP forwarding
+      # -----------------------------------
+      - name: Enable IP forwarding
+        run: |
+
+          echo 'net.ipv4.ip_forward = 1' \
+          | sudo tee /etc/sysctl.d/99-tailscale.conf
+
+          echo 'net.ipv6.conf.all.forwarding = 1' \
+          | sudo tee -a /etc/sysctl.d/99-tailscale.conf
+
+          sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+      # -----------------------------------
+      # Start tailscaled
+      # -----------------------------------
+      - name: Start tailscaled
+        run: |
+          sudo systemctl enable --now tailscaled
+
+      # -----------------------------------
+      # Connect to Tailscale
+      # -----------------------------------
+      - name: Connect to Tailscale
+        run: |
+
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --advertise-exit-node \
+            --advertise-tags=tag:exit-node \
+            --hostname="$HOSTNAME"
+
+      # -----------------------------------
+      # Configure NAT
+      # -----------------------------------
+      - name: Configure NAT
+        run: |
+
+          DEFAULT_IF=$(ip route | grep default | awk '{print $5}' | head -n1)
+
+          echo "Default Interface: $DEFAULT_IF"
+
+          sudo iptables -A FORWARD -i tailscale0 -o $DEFAULT_IF -j ACCEPT
+
+          sudo iptables -A FORWARD \
+            -i $DEFAULT_IF \
+            -o tailscale0 \
+            -m state --state RELATED,ESTABLISHED \
+            -j ACCEPT
+
+          sudo iptables -t nat -A POSTROUTING -o $DEFAULT_IF -j MASQUERADE
+
+      # -----------------------------------
+      # Show status
+      # -----------------------------------
+      - name: Tailscale status
+        run: |
+          tailscale status
+
+      # -----------------------------------
+      # Wait, then trigger the next workflow
+      # -----------------------------------
+      - name: Wait and trigger next workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - START_TS))
+          WAIT=$((TOTAL_SECONDS - TRIGGER_BEFORE_SECONDS - ELAPSED))
+
+          if [ "$WAIT" -lt 0 ]; then WAIT=0; fi
+
+          echo "======================================"
+          echo "Exit Node ACTIVE"
+          echo "Hostname: $HOSTNAME"
+          echo "Chain enabled: $CHAIN"
+          echo "======================================"
+
+          sleep "$WAIT"
+
+          if [ "$CHAIN" = "false" ]; then
+            echo "Chain disabled (manual run). Not triggering $NEXT_WORKFLOW."
+            exit 0
+          fi
+
+          echo "Triggering $NEXT_WORKFLOW ..."
+
+          # تا 3 بار تلاش می‌کند
+          for i in 1 2 3; do
+            if gh workflow run "$NEXT_WORKFLOW" \
+                 --repo "${{ github.repository }}" \
+                 --ref "${{ github.ref_name }}" \
+                 -f chain=true; then
+              echo "Triggered successfully."
+              break
+            fi
+            echo "Attempt $i failed, retrying in 15s..."
+            sleep 15
+          done
+
+      # -----------------------------------
+      # Keep runner alive until the end
+      # -----------------------------------
+      - name: Keep runner alive until end
+        run: |
+
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - START_TS))
+          REMAIN=$((TOTAL_SECONDS - ELAPSED))
+
+          if [ "$REMAIN" -gt 0 ]; then
+            echo "Staying alive for another ${REMAIN}s..."
+            sleep "$REMAIN"
+          fi
+
+          echo "Done. Shutting down."
